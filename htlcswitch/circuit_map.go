@@ -144,11 +144,7 @@ var (
 // always identifiable by their incoming CircuitKey, in addition to their
 // outgoing CircuitKey if the circuit is fully-opened.
 type circuitMap struct {
-	// db provides the persistent storage engine for the circuit map.
-	//
-	// TODO(conner): create abstraction to allow for the substitution of
-	// other persistence engines.
-	db *channeldb.DB
+	cfg *CircuitMapConfig
 
 	mtx sync.RWMutex
 
@@ -172,10 +168,23 @@ type circuitMap struct {
 	hashIndex map[[32]byte]map[CircuitKey]struct{}
 }
 
+// CircuitMapConfig houses the critical interfaces and references necessary to
+// parameterize an instance of circuitMap.
+type CircuitMapConfig struct {
+	// DB provides the persistent storage engine for the circuit map.
+	// TODO(conner): create abstraction to allow for the substitution of
+	// other persistence engines.
+	DB *channeldb.DB
+
+	// ExtractErrorEncrypter derives the shared secret used to encrypt
+	// errors from the obfuscator's ephemeral public key.
+	ExtractErrorEncrypter ErrorEncrypterExtracter
+}
+
 // NewCircuitMap creates a new instance of the circuitMap.
-func NewCircuitMap(db *channeldb.DB) (CircuitMap, error) {
+func NewCircuitMap(cfg *CircuitMapConfig) (CircuitMap, error) {
 	cm := &circuitMap{
-		db: db,
+		cfg: cfg,
 	}
 
 	// Initialize the on-disk buckets used by the circuit map.
@@ -203,7 +212,7 @@ func NewCircuitMap(db *channeldb.DB) (CircuitMap, error) {
 // initBuckets ensures that the primary buckets used by the circuit are
 // initialized so that we can assume their existence after startup.
 func (cm *circuitMap) initBuckets() error {
-	return cm.db.Update(func(tx *bolt.Tx) error {
+	return cm.cfg.DB.Update(func(tx *bolt.Tx) error {
 		_, err := tx.CreateBucketIfNotExists(circuitKeystoneKey)
 		if err != nil {
 			return err
@@ -216,8 +225,10 @@ func (cm *circuitMap) initBuckets() error {
 
 // restoreMemState loads the contents of the half circuit and full circuit
 // buckets from disk and reconstructs the in-memory representation of the
-// circuit map.  Afterwards, the state of the hash index is reconstructed using
-// the recovered set of full circuits.
+// circuit map. Afterwards, the state of the hash index is reconstructed using
+// the recovered set of full circuits. This method will also remove any stray
+// keystones, which are those that appear fully-opened, but have no pending
+// circuit related to the intended incoming link.
 func (cm *circuitMap) restoreMemState() error {
 	log.Infof("Restoring in-memory circuit state from disk")
 
@@ -226,7 +237,7 @@ func (cm *circuitMap) restoreMemState() error {
 		pending = make(map[CircuitKey]*PaymentCircuit)
 	)
 
-	if err := cm.db.View(func(tx *bolt.Tx) error {
+	if err := cm.cfg.DB.Update(func(tx *bolt.Tx) error {
 		// Restore any of the circuits persisted in the circuit bucket
 		// back into memory.
 		circuitBkt := tx.Bucket(circuitAddKey)
@@ -235,7 +246,7 @@ func (cm *circuitMap) restoreMemState() error {
 		}
 
 		if err := circuitBkt.ForEach(func(_, v []byte) error {
-			circuit, err := decodeCircuit(v)
+			circuit, err := cm.decodeCircuit(v)
 			if err != nil {
 				return err
 			}
@@ -255,6 +266,7 @@ func (cm *circuitMap) restoreMemState() error {
 			return ErrCorruptedCircuitMap
 		}
 
+		var strayKeystones []Keystone
 		if err := keystoneBkt.ForEach(func(k, v []byte) error {
 			var (
 				inKey  CircuitKey
@@ -271,13 +283,43 @@ func (cm *circuitMap) restoreMemState() error {
 
 			// Retrieve the pending circuit, set its keystone, then
 			// add it to the opened map.
-			circuit := pending[inKey]
-			circuit.Outgoing = outKey
-			opened[*outKey] = circuit
+			circuit, ok := pending[inKey]
+			if ok {
+				circuit.Outgoing = outKey
+				opened[*outKey] = circuit
+			} else {
+				strayKeystones = append(strayKeystones, Keystone{
+					InKey:  inKey,
+					OutKey: *outKey,
+				})
+			}
 
 			return nil
 		}); err != nil {
 			return err
+		}
+
+		// If any stray keystones were found, we'll proceed to prune
+		// them from the circuit map's persistent storage. This may
+		// manifest on older nodes that had updated channels before
+		// their short channel id was set properly. We believe this
+		// issue has been fixed, though this will allow older nodes to
+		// recover without additional intervention.
+		for _, strayKeystone := range strayKeystones {
+			// As a precaution, we will only cleanup keystones
+			// related to locally-initiated payments. If a
+			// documented case of stray keystones emerges for
+			// forwarded payments, this check should be removed, but
+			// with extreme caution.
+			if strayKeystone.OutKey.ChanID != sourceHop {
+				continue
+			}
+
+			log.Infof("Removing stray keystone: %v", strayKeystone)
+			err := keystoneBkt.Delete(strayKeystone.OutKey.Bytes())
+			if err != nil {
+				return err
+			}
 		}
 
 		return nil
@@ -305,8 +347,9 @@ func (cm *circuitMap) restoreMemState() error {
 
 // decodeCircuit reconstructs an in-memory payment circuit from a byte slice.
 // The byte slice is assumed to have been generated by the circuit's Encode
-// method.
-func decodeCircuit(v []byte) (*PaymentCircuit, error) {
+// method. If the decoding is successful, the onion obfuscator will be
+// reextracted, since it is not stored in plaintext on disk.
+func (cm *circuitMap) decodeCircuit(v []byte) (*PaymentCircuit, error) {
 	var circuit = &PaymentCircuit{}
 
 	circuitReader := bytes.NewReader(v)
@@ -314,18 +357,34 @@ func decodeCircuit(v []byte) (*PaymentCircuit, error) {
 		return nil, err
 	}
 
+	// If the error encrypter is nil, this is locally-source payment so
+	// there is no encrypter.
+	if circuit.ErrorEncrypter == nil {
+		return circuit, nil
+	}
+
+	// Otherwise, we need to reextract the encrypter, so that the shared
+	// secret is rederived from what was decoded.
+	err := circuit.ErrorEncrypter.Reextract(
+		cm.cfg.ExtractErrorEncrypter,
+	)
+	if err != nil {
+		return nil, err
+	}
+
 	return circuit, nil
 }
 
 // trimAllOpenCircuits reads the set of active channels from disk and trims
-// keystones for any non-pending channels. This method is intended to be called
-// on startup. Each link will also trim it's own circuits upon startup.
+// keystones for any non-pending channels using the next unallocated htlc index.
+// This method is intended to be called on startup. Each link will also trim
+// it's own circuits upon startup.
 //
 // NOTE: This operation will be applied to the persistent state of all active
 // channels. Therefore, it must be called before any links are created to avoid
 // interfering with normal operation.
 func (cm *circuitMap) trimAllOpenCircuits() error {
-	activeChannels, err := cm.db.FetchAllChannels()
+	activeChannels, err := cm.cfg.DB.FetchAllOpenChannels()
 	if err != nil {
 		return err
 	}
@@ -335,9 +394,27 @@ func (cm *circuitMap) trimAllOpenCircuits() error {
 			continue
 		}
 
-		chanID := activeChannel.ShortChanID
-		start := activeChannel.LocalCommitment.LocalHtlcIndex
-		if err := cm.TrimOpenCircuits(chanID, start); err != nil {
+		// First, skip any channels that have not been assigned their
+		// final channel identifier, otherwise we would try to trim
+		// htlcs belonging to the all-zero, sourceHop ID.
+		chanID := activeChannel.ShortChanID()
+		if chanID == sourceHop {
+			continue
+		}
+
+		// Next, retrieve the next unallocated htlc index, which bounds
+		// the cutoff of confirmed htlc indexes.
+		start, err := activeChannel.NextLocalHtlcIndex()
+		if err != nil {
+			return err
+		}
+
+		// Finally, remove all pending circuits above at or above the
+		// next unallocated local htlc indexes. This has the effect of
+		// reverting any circuits that have either not been locked in,
+		// or had not been included in a pending commitment.
+		err = cm.TrimOpenCircuits(chanID, start)
+		if err != nil {
 			return err
 		}
 	}
@@ -385,7 +462,7 @@ func (cm *circuitMap) TrimOpenCircuits(chanID lnwire.ShortChannelID,
 		return nil
 	}
 
-	return cm.db.Update(func(tx *bolt.Tx) error {
+	return cm.cfg.DB.Update(func(tx *bolt.Tx) error {
 		keystoneBkt := tx.Bucket(circuitKeystoneKey)
 		if keystoneBkt == nil {
 			return ErrCorruptedCircuitMap
@@ -451,8 +528,13 @@ func (cm *circuitMap) LookupByPaymentHash(hash [32]byte) []*PaymentCircuit {
 func (cm *circuitMap) CommitCircuits(circuits ...*PaymentCircuit) (
 	*CircuitFwdActions, error) {
 
+	inKeys := make([]CircuitKey, 0, len(circuits))
+	for _, circuit := range circuits {
+		inKeys = append(inKeys, circuit.Incoming)
+	}
+
 	log.Tracef("Committing fresh circuits: %v", newLogClosure(func() string {
-		return spew.Sdump(circuits)
+		return spew.Sdump(inKeys)
 	}))
 
 	actions := &CircuitFwdActions{}
@@ -533,7 +615,7 @@ func (cm *circuitMap) CommitCircuits(circuits ...*PaymentCircuit) (
 	// Write the entire batch of circuits to the persistent circuit bucket
 	// using bolt's Batch write. This method must be called from multiple,
 	// distinct goroutines to have any impact on performance.
-	err := cm.db.Batch(func(tx *bolt.Tx) error {
+	err := cm.cfg.DB.Batch(func(tx *bolt.Tx) error {
 		circuitBkt := tx.Bucket(circuitAddKey)
 		if circuitBkt == nil {
 			return ErrCorruptedCircuitMap
@@ -623,7 +705,7 @@ func (cm *circuitMap) OpenCircuits(keystones ...Keystone) error {
 	}
 	cm.mtx.RUnlock()
 
-	err := cm.db.Update(func(tx *bolt.Tx) error {
+	err := cm.cfg.DB.Update(func(tx *bolt.Tx) error {
 		// Now, load the circuit bucket to which we will write the
 		// already serialized circuit.
 		keystoneBkt := tx.Bucket(circuitKeystoneKey)
@@ -721,10 +803,12 @@ func (cm *circuitMap) CloseCircuit(outKey CircuitKey) (*PaymentCircuit, error) {
 	return circuit, nil
 }
 
-// DeleteCircuits destroys the target circuit by removing it from the circuit map,
-// additionally removing the circuit's keystone if the HTLC was forwarded
-// through an outgoing link. The circuit should be identified by its incoming
-// circuit key.
+// DeleteCircuits destroys the target circuits by removing them from the circuit
+// map, additionally removing the circuits' keystones if any HTLCs were
+// forwarded through an outgoing link. The circuits should be identified by its
+// incoming circuit key. If a given circuit is not found in the circuit map, it
+// will be ignored from the query. This would typically indicate that the
+// circuit was already cleaned up at a different point in time.
 func (cm *circuitMap) DeleteCircuits(inKeys ...CircuitKey) error {
 
 	log.Tracef("Deleting resolved circuits: %v", newLogClosure(func() string {
@@ -737,22 +821,15 @@ func (cm *circuitMap) DeleteCircuits(inKeys ...CircuitKey) error {
 	)
 
 	cm.mtx.Lock()
-	// First check that all provided keys are still known to the circuit
-	// map.
+	// Remove any references to the circuits from memory, keeping track of
+	// which circuits were removed, and which ones had been marked closed.
+	// This can be used to restore these entries later if the persistent
+	// removal fails.
 	for _, inKey := range inKeys {
-		if _, ok := cm.pending[inKey]; !ok {
-			cm.mtx.Unlock()
-			return ErrUnknownCircuit
+		circuit, ok := cm.pending[inKey]
+		if !ok {
+			continue
 		}
-	}
-
-	// If no offenders were found, remove any references to the circuit from
-	// memory, keeping track of which circuits were removed, and which ones
-	// had been marked closed. This can be used to restore these entries
-	// later if the persistent removal fails.
-	for _, inKey := range inKeys {
-		circuit := cm.pending[inKey]
-
 		delete(cm.pending, inKey)
 
 		if _, ok := cm.closed[inKey]; ok {
@@ -769,7 +846,7 @@ func (cm *circuitMap) DeleteCircuits(inKeys ...CircuitKey) error {
 	}
 	cm.mtx.Unlock()
 
-	err := cm.db.Batch(func(tx *bolt.Tx) error {
+	err := cm.cfg.DB.Batch(func(tx *bolt.Tx) error {
 		for _, circuit := range removedCircuits {
 			// If this htlc made it to an outgoing link, load the
 			// keystone bucket from which we will remove the

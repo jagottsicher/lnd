@@ -4,21 +4,27 @@ import (
 	"crypto/sha256"
 	"fmt"
 
-	"github.com/roasbeef/btcd/btcec"
-	"github.com/roasbeef/btcwallet/waddrmgr"
-	"github.com/roasbeef/btcwallet/wallet"
-	"github.com/roasbeef/btcwallet/walletdb"
+	"github.com/btcsuite/btcd/btcec"
+	"github.com/btcsuite/btcwallet/waddrmgr"
+	"github.com/btcsuite/btcwallet/wallet"
+	"github.com/btcsuite/btcwallet/walletdb"
+)
+
+const (
+	// CoinTypeBitcoin specifies the BIP44 coin type for Bitcoin key
+	// derivation.
+	CoinTypeBitcoin uint32 = 0
+
+	// CoinTypeTestnet specifies the BIP44 coin type for all testnet key
+	// derivation.
+	CoinTypeTestnet = 1
+
+	// CoinTypeLitecoin specifies the BIP44 coin type for Litecoin key
+	// derivation.
+	CoinTypeLitecoin = 2
 )
 
 var (
-	// lightningKeyScope is the key scope that will be used within the
-	// waddrmgr to create an HD chain for deriving all of our required
-	// keys.
-	lightningKeyScope = waddrmgr.KeyScope{
-		Purpose: BIP0043Purpose,
-		Coin:    0,
-	}
-
 	// lightningAddrSchema is the scope addr schema for all keys that we
 	// derive. We'll treat them all as p2wkh addresses, as atm we must
 	// specify a particular type.
@@ -44,6 +50,10 @@ type BtcWalletKeyRing struct {
 	// transactions in order to derive addresses and lookup relevant keys
 	wallet *wallet.Wallet
 
+	// chainKeyScope defines the purpose and coin type to be used when generating
+	// keys for this keyring.
+	chainKeyScope waddrmgr.KeyScope
+
 	// lightningScope is a pointer to the scope that we'll be using as a
 	// sub key manager to derive all the keys that we require.
 	lightningScope *waddrmgr.ScopedKeyManager
@@ -54,9 +64,18 @@ type BtcWalletKeyRing struct {
 //
 // NOTE: The passed waddrmgr.Manager MUST be unlocked in order for the keychain
 // to function.
-func NewBtcWalletKeyRing(w *wallet.Wallet) SecretKeyRing {
+func NewBtcWalletKeyRing(w *wallet.Wallet, coinType uint32) SecretKeyRing {
+	// Construct the key scope that will be used within the waddrmgr to
+	// create an HD chain for deriving all of our required keys. A different
+	// scope is used for each specific coin type.
+	chainKeyScope := waddrmgr.KeyScope{
+		Purpose: BIP0043Purpose,
+		Coin:    coinType,
+	}
+
 	return &BtcWalletKeyRing{
-		wallet: w,
+		wallet:        w,
+		chainKeyScope: chainKeyScope,
 	}
 }
 
@@ -80,9 +99,7 @@ func (b *BtcWalletKeyRing) keyScope() (*waddrmgr.ScopedKeyManager, error) {
 
 	// If the manager is indeed unlocked, then we'll fetch the scope, cache
 	// it, and return to the caller.
-	lnScope, err := b.wallet.Manager.FetchScopedKeyManager(
-		lightningKeyScope,
-	)
+	lnScope, err := b.wallet.Manager.FetchScopedKeyManager(b.chainKeyScope)
 	if err != nil {
 		return nil, err
 	}
@@ -122,7 +139,10 @@ func (b *BtcWalletKeyRing) createAccountIfNotExists(
 //
 // NOTE: This is part of the keychain.KeyRing interface.
 func (b *BtcWalletKeyRing) DeriveNextKey(keyFam KeyFamily) (KeyDescriptor, error) {
-	var pubKey *btcec.PublicKey
+	var (
+		pubKey *btcec.PublicKey
+		keyLoc KeyLocator
+	)
 
 	db := b.wallet.Database()
 	err := walletdb.Update(db, func(tx walletdb.ReadWriteTx) error {
@@ -148,7 +168,21 @@ func (b *BtcWalletKeyRing) DeriveNextKey(keyFam KeyFamily) (KeyDescriptor, error
 			return err
 		}
 
-		pubKey = addrs[0].(waddrmgr.ManagedPubKeyAddress).PubKey()
+		// Extract the first address, ensuring that it is of the proper
+		// interface type, otherwise we can't manipulate it below.
+		addr, ok := addrs[0].(waddrmgr.ManagedPubKeyAddress)
+		if !ok {
+			return fmt.Errorf("address is not a managed pubkey " +
+				"addr")
+		}
+
+		pubKey = addr.PubKey()
+
+		_, pathInfo, _ := addr.DerivationInfo()
+		keyLoc = KeyLocator{
+			Family: keyFam,
+			Index:  pathInfo.Index,
+		}
 
 		return nil
 	})
@@ -157,7 +191,8 @@ func (b *BtcWalletKeyRing) DeriveNextKey(keyFam KeyFamily) (KeyDescriptor, error
 	}
 
 	return KeyDescriptor{
-		PubKey: pubKey,
+		PubKey:     pubKey,
+		KeyLocator: keyLoc,
 	}, nil
 }
 

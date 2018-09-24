@@ -8,12 +8,12 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/btcsuite/btcd/btcec"
+	"github.com/btcsuite/btcd/chaincfg/chainhash"
+	"github.com/btcsuite/btcd/txscript"
+	"github.com/btcsuite/btcd/wire"
+	"github.com/btcsuite/btcutil"
 	"github.com/lightningnetwork/lnd/lnwallet"
-	"github.com/roasbeef/btcd/btcec"
-	"github.com/roasbeef/btcd/chaincfg/chainhash"
-	"github.com/roasbeef/btcd/txscript"
-	"github.com/roasbeef/btcd/wire"
-	"github.com/roasbeef/btcutil"
 )
 
 var (
@@ -336,6 +336,8 @@ func init() {
 }
 
 func TestKidOutputSerialization(t *testing.T) {
+	t.Parallel()
+
 	for i, kid := range kidOutputs {
 		var b bytes.Buffer
 		if err := kid.Encode(&b); err != nil {
@@ -358,6 +360,8 @@ func TestKidOutputSerialization(t *testing.T) {
 }
 
 func TestBabyOutputSerialization(t *testing.T) {
+	t.Parallel()
+
 	for i, baby := range babyOutputs {
 		var b bytes.Buffer
 		if err := baby.Encode(&b); err != nil {

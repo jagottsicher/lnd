@@ -6,29 +6,120 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/btcsuite/btcd/btcec"
+	bitcoinCfg "github.com/btcsuite/btcd/chaincfg"
+	"github.com/btcsuite/btcutil"
+	"github.com/lightningnetwork/lightning-onion"
 	"github.com/lightningnetwork/lnd/channeldb"
 	"github.com/lightningnetwork/lnd/htlcswitch"
 	"github.com/lightningnetwork/lnd/lnwire"
-	"github.com/roasbeef/btcutil"
 )
 
 var (
 	hash1 = [32]byte{0x01}
 	hash2 = [32]byte{0x02}
 	hash3 = [32]byte{0x03}
+
+	// sphinxPrivKey is the private key given to freshly created sphinx
+	// routers.
+	sphinxPrivKey *btcec.PrivateKey
+
+	// testEphemeralKey is the ephemeral key that will be extracted to
+	// create onion obfuscators.
+	testEphemeralKey *btcec.PublicKey
+
+	// testExtracter is a precomputed extraction of testEphemeralKey, using
+	// the sphinxPrivKey.
+	testExtracter *htlcswitch.SphinxErrorEncrypter
 )
 
-func TestCircuitMapInit(t *testing.T) {
-	t.Parallel()
+func init() {
+	// Generate a fresh key for our sphinx router.
+	var err error
+	sphinxPrivKey, err = btcec.NewPrivateKey(btcec.S256())
+	if err != nil {
+		panic(err)
+	}
 
-	// Initialize new database for circuit map.
-	cdb := makeCircuitDB(t, "")
-	_, err := htlcswitch.NewCircuitMap(cdb)
+	// And another, whose public key will serve as the test ephemeral key.
+	testEphemeralPriv, err := btcec.NewPrivateKey(btcec.S256())
+	if err != nil {
+		panic(err)
+	}
+	testEphemeralKey = testEphemeralPriv.PubKey()
+
+	// Finally, properly initialize the test extracter
+	initTestExtracter()
+}
+
+// initTestExtracter spins up a new onion processor specifically for the purpose
+// of generating our testExtracter, which should be derived from the
+// testEphemeralKey, and which randomly-generated key is used to init the sphinx
+// router.
+//
+// NOTE: This should be called in init(), after testEphemeralKey has been
+// properly initialized.
+func initTestExtracter() {
+	onionProcessor := newOnionProcessor(nil)
+	defer onionProcessor.Stop()
+
+	obfuscator, _ := onionProcessor.ExtractErrorEncrypter(
+		testEphemeralKey,
+	)
+
+	sphinxExtracter, ok := obfuscator.(*htlcswitch.SphinxErrorEncrypter)
+	if !ok {
+		panic("did not extract sphinx error encrypter")
+	}
+
+	testExtracter = sphinxExtracter
+
+	// We also set this error extracter on startup, otherwise it will be nil
+	// at compile-time.
+	halfCircuitTests[2].encrypter = testExtracter
+}
+
+// newOnionProcessor creates starts a new htlcswitch.OnionProcessor using a temp
+// db and no garbage collection.
+func newOnionProcessor(t *testing.T) *htlcswitch.OnionProcessor {
+	sphinxRouter := sphinx.NewRouter(
+		sphinxPrivKey, &bitcoinCfg.SimNetParams, sphinx.NewMemoryReplayLog(),
+	)
+
+	if err := sphinxRouter.Start(); err != nil {
+		t.Fatalf("unable to start sphinx router: %v", err)
+	}
+
+	return htlcswitch.NewOnionProcessor(sphinxRouter)
+}
+
+// newCircuitMap creates a new htlcswitch.CircuitMap using a temp db and a
+// fresh sphinx router.
+func newCircuitMap(t *testing.T) (*htlcswitch.CircuitMapConfig,
+	htlcswitch.CircuitMap) {
+
+	onionProcessor := newOnionProcessor(t)
+
+	circuitMapCfg := &htlcswitch.CircuitMapConfig{
+		DB: makeCircuitDB(t, ""),
+		ExtractErrorEncrypter: onionProcessor.ExtractErrorEncrypter,
+	}
+
+	circuitMap, err := htlcswitch.NewCircuitMap(circuitMapCfg)
 	if err != nil {
 		t.Fatalf("unable to create persistent circuit map: %v", err)
 	}
 
-	restartCircuitMap(t, cdb)
+	return circuitMapCfg, circuitMap
+}
+
+// TestCircuitMapInit is a quick check to ensure that we can start and restore
+// the circuit map, as this will be used extensively in this suite.
+func TestCircuitMapInit(t *testing.T) {
+	t.Parallel()
+
+	cfg, _ := newCircuitMap(t)
+	restartCircuitMap(t, cfg)
 }
 
 var halfCircuitTests = []struct {
@@ -56,12 +147,15 @@ var halfCircuitTests = []struct {
 		encrypter: htlcswitch.NewMockObfuscator(),
 	},
 	{
-		hash:      hash3,
-		inValue:   10000,
-		outValue:  9000,
-		chanID:    lnwire.NewShortChanIDFromInt(3),
-		htlcID:    3,
-		encrypter: htlcswitch.NewSphinxErrorEncrypter(),
+		hash:     hash3,
+		inValue:  10000,
+		outValue: 9000,
+		chanID:   lnwire.NewShortChanIDFromInt(3),
+		htlcID:   3,
+		// NOTE: The value of testExtracter is nil at compile-time, it
+		// is fully-initialized in initTestExtracter, which should
+		// repopulate this encrypter.
+		encrypter: testExtracter,
 	},
 }
 
@@ -71,6 +165,8 @@ var halfCircuitTests = []struct {
 // reconstructed from a serialized half circuit.
 func TestHalfCircuitSerialization(t *testing.T) {
 	t.Parallel()
+
+	onionProcessor := newOnionProcessor(t)
 
 	for i, test := range halfCircuitTests {
 		circuit := &htlcswitch.PaymentCircuit{
@@ -97,6 +193,20 @@ func TestHalfCircuitSerialization(t *testing.T) {
 			t.Fatalf("unable to decode half payment circuit test=%d: %v", i, err)
 		}
 
+		// If the error encrypter is initialized, we will need to
+		// reextract it from it's decoded state, as this requires an
+		// ECDH with the onion processor's private key. For mock error
+		// encrypters, this will be a NOP.
+		if circuit2.ErrorEncrypter != nil {
+			err := circuit2.ErrorEncrypter.Reextract(
+				onionProcessor.ExtractErrorEncrypter,
+			)
+			if err != nil {
+				t.Fatalf("unable to reextract sphinx error "+
+					"encrypter: %v", err)
+			}
+		}
+
 		// Reconstructed half circuit should match the original.
 		if !equalIgnoreLFD(circuit, &circuit2) {
 			t.Fatalf("unexpected half circuit test=%d, want %v, got %v",
@@ -115,13 +225,12 @@ func TestCircuitMapPersistence(t *testing.T) {
 		err        error
 	)
 
-	cdb := makeCircuitDB(t, "")
-	circuitMap, err = htlcswitch.NewCircuitMap(cdb)
-	if err != nil {
-		t.Fatalf("unable to create persistent circuit map: %v", err)
-	}
+	cfg, circuitMap := newCircuitMap(t)
 
-	circuit := circuitMap.LookupCircuit(htlcswitch.CircuitKey{chan1, 0})
+	circuit := circuitMap.LookupCircuit(htlcswitch.CircuitKey{
+		ChanID: chan1,
+		HtlcID: 0,
+	})
 	if circuit != nil {
 		t.Fatalf("LookupByHTLC returned a circuit before any were added: %v",
 			circuit)
@@ -143,7 +252,7 @@ func TestCircuitMapPersistence(t *testing.T) {
 	assertNumCircuitsWithHash(t, circuitMap, hash1, 0)
 	assertHasCircuit(t, circuitMap, circuit1)
 
-	cdb, circuitMap = restartCircuitMap(t, cdb)
+	cfg, circuitMap = restartCircuitMap(t, cfg)
 
 	assertNumCircuitsWithHash(t, circuitMap, hash1, 0)
 	assertHasCircuit(t, circuitMap, circuit1)
@@ -168,7 +277,7 @@ func TestCircuitMapPersistence(t *testing.T) {
 	assertHasCircuit(t, circuitMap, circuit1)
 	assertHasKeystone(t, circuitMap, keystone1.OutKey, circuit1)
 
-	cdb, circuitMap = restartCircuitMap(t, cdb)
+	cfg, circuitMap = restartCircuitMap(t, cfg)
 
 	assertNumCircuitsWithHash(t, circuitMap, hash1, 1)
 	assertHasCircuit(t, circuitMap, circuit1)
@@ -213,7 +322,7 @@ func TestCircuitMapPersistence(t *testing.T) {
 
 	assertNumCircuitsWithHash(t, circuitMap, hash3, 0)
 
-	cdb, circuitMap = restartCircuitMap(t, cdb)
+	cfg, circuitMap = restartCircuitMap(t, cfg)
 
 	assertNumCircuitsWithHash(t, circuitMap, hash1, 1)
 	assertHasCircuit(t, circuitMap, circuit1)
@@ -238,7 +347,7 @@ func TestCircuitMapPersistence(t *testing.T) {
 	}
 
 	assertHasCircuit(t, circuitMap, circuit3)
-	cdb, circuitMap = restartCircuitMap(t, cdb)
+	cfg, circuitMap = restartCircuitMap(t, cfg)
 	assertHasCircuit(t, circuitMap, circuit3)
 
 	// Add another circuit with an already-used HTLC ID but different
@@ -260,7 +369,7 @@ func TestCircuitMapPersistence(t *testing.T) {
 	assertHasKeystone(t, circuitMap, keystone1.OutKey, circuit1)
 	assertHasKeystone(t, circuitMap, keystone2.OutKey, circuit2)
 	assertHasKeystone(t, circuitMap, keystone3.OutKey, circuit3)
-	cdb, circuitMap = restartCircuitMap(t, cdb)
+	cfg, circuitMap = restartCircuitMap(t, cfg)
 	assertHasKeystone(t, circuitMap, keystone1.OutKey, circuit1)
 	assertHasKeystone(t, circuitMap, keystone2.OutKey, circuit2)
 	assertHasKeystone(t, circuitMap, keystone3.OutKey, circuit3)
@@ -294,7 +403,7 @@ func TestCircuitMapPersistence(t *testing.T) {
 	assertNumCircuitsWithHash(t, circuitMap, hash1, 1)
 	assertHasCircuit(t, circuitMap, circuit4)
 
-	cdb, circuitMap = restartCircuitMap(t, cdb)
+	cfg, circuitMap = restartCircuitMap(t, cfg)
 
 	assertNumCircuitsWithHash(t, circuitMap, hash1, 1)
 	assertHasCircuit(t, circuitMap, circuit4)
@@ -335,7 +444,7 @@ func TestCircuitMapPersistence(t *testing.T) {
 	assertHasCircuitForHash(t, circuitMap, hash3, circuit3)
 
 	// Restart, then run checks again.
-	cdb, circuitMap = restartCircuitMap(t, cdb)
+	cfg, circuitMap = restartCircuitMap(t, cfg)
 
 	// Verify that all circuits have been fully added.
 	assertHasCircuit(t, circuitMap, circuit1)
@@ -368,14 +477,15 @@ func TestCircuitMapPersistence(t *testing.T) {
 	// should be circuit4.
 	assertNumCircuitsWithHash(t, circuitMap, hash1, 1)
 	assertHasCircuitForHash(t, circuitMap, hash1, circuit4)
-	cdb, circuitMap = restartCircuitMap(t, cdb)
+	cfg, circuitMap = restartCircuitMap(t, cfg)
 	assertNumCircuitsWithHash(t, circuitMap, hash1, 1)
 	assertHasCircuitForHash(t, circuitMap, hash1, circuit4)
 
 	// Removing already-removed circuit should return an error.
 	err = circuitMap.DeleteCircuits(circuit1.Incoming)
-	if err == nil {
-		t.Fatal("Remove did not return expected not found error")
+	if err != nil {
+		t.Fatal("Unexpected failure when deleting already "+
+			"deleted circuit: %v", err)
 	}
 
 	// Verify that nothing related to hash1 has changed
@@ -391,7 +501,7 @@ func TestCircuitMapPersistence(t *testing.T) {
 	assertNumCircuitsWithHash(t, circuitMap, hash1, 0)
 	assertNumCircuitsWithHash(t, circuitMap, hash2, 1)
 	assertNumCircuitsWithHash(t, circuitMap, hash3, 1)
-	cdb, circuitMap = restartCircuitMap(t, cdb)
+	cfg, circuitMap = restartCircuitMap(t, cfg)
 	assertNumCircuitsWithHash(t, circuitMap, hash1, 0)
 	assertNumCircuitsWithHash(t, circuitMap, hash2, 1)
 	assertNumCircuitsWithHash(t, circuitMap, hash3, 1)
@@ -405,19 +515,26 @@ func TestCircuitMapPersistence(t *testing.T) {
 	// There should now only be one remaining circuit, with hash3.
 	assertNumCircuitsWithHash(t, circuitMap, hash2, 0)
 	assertNumCircuitsWithHash(t, circuitMap, hash3, 1)
-	cdb, circuitMap = restartCircuitMap(t, cdb)
+	cfg, circuitMap = restartCircuitMap(t, cfg)
 	assertNumCircuitsWithHash(t, circuitMap, hash2, 0)
 	assertNumCircuitsWithHash(t, circuitMap, hash3, 1)
 
-	// Remove last remaining circuit with payment hash hash3.
-	err = circuitMap.DeleteCircuits(circuit3.Incoming)
+	// In removing the final circuit, we will try and remove all other known
+	// circuits as well. Any circuits that are unknown to the circuit map
+	// will be ignored, and only circuit 3 should be cause any change in the
+	// state.
+	err = circuitMap.DeleteCircuits(
+		circuit1.Incoming, circuit2.Incoming,
+		circuit3.Incoming, circuit4.Incoming,
+	)
 	if err != nil {
-		t.Fatalf("Remove returned unexpected error: %v", err)
+		t.Fatalf("Unexpected failure when removing circuit while also "+
+			"deleting already deleted circuits: %v", err)
 	}
 
 	// Check that the circuit map is empty, even after restarting.
 	assertNumCircuitsWithHash(t, circuitMap, hash3, 0)
-	cdb, circuitMap = restartCircuitMap(t, cdb)
+	cfg, circuitMap = restartCircuitMap(t, cfg)
 	assertNumCircuitsWithHash(t, circuitMap, hash3, 0)
 }
 
@@ -534,21 +651,24 @@ func makeCircuitDB(t *testing.T, path string) *channeldb.DB {
 
 // Creates a new circuit map, backed by a freshly opened channeldb. The existing
 // channeldb is closed in order to simulate a complete restart.
-func restartCircuitMap(t *testing.T, cdb *channeldb.DB) (*channeldb.DB,
-	htlcswitch.CircuitMap) {
+func restartCircuitMap(t *testing.T, cfg *htlcswitch.CircuitMapConfig) (
+	*htlcswitch.CircuitMapConfig, htlcswitch.CircuitMap) {
 
 	// Record the current temp path and close current db.
-	dbPath := cdb.Path()
-	cdb.Close()
+	dbPath := cfg.DB.Path()
+	cfg.DB.Close()
 
 	// Reinitialize circuit map with same db path.
-	cdb2 := makeCircuitDB(t, dbPath)
-	cm2, err := htlcswitch.NewCircuitMap(cdb2)
+	cfg2 := &htlcswitch.CircuitMapConfig{
+		DB: makeCircuitDB(t, dbPath),
+		ExtractErrorEncrypter: cfg.ExtractErrorEncrypter,
+	}
+	cm2, err := htlcswitch.NewCircuitMap(cfg2)
 	if err != nil {
 		t.Fatalf("unable to recreate persistent circuit map: %v", err)
 	}
 
-	return cdb2, cm2
+	return cfg2, cm2
 }
 
 // TestCircuitMapCommitCircuits tests the following behavior of CommitCircuits:
@@ -564,18 +684,14 @@ func TestCircuitMapCommitCircuits(t *testing.T) {
 		err        error
 	)
 
-	cdb := makeCircuitDB(t, "")
-	circuitMap, err = htlcswitch.NewCircuitMap(cdb)
-	if err != nil {
-		t.Fatalf("unable to create persistent circuit map: %v", err)
-	}
+	cfg, circuitMap := newCircuitMap(t)
 
 	circuit := &htlcswitch.PaymentCircuit{
 		Incoming: htlcswitch.CircuitKey{
 			ChanID: chan1,
 			HtlcID: 3,
 		},
-		ErrorEncrypter: htlcswitch.NewSphinxErrorEncrypter(),
+		ErrorEncrypter: testExtracter,
 	}
 
 	// First we will try to add an new circuit to the circuit map, this
@@ -622,8 +738,8 @@ func TestCircuitMapCommitCircuits(t *testing.T) {
 	// Finally, restart the circuit map, which will cause the added circuit
 	// to be loaded from disk. Since the keystone was never set, subsequent
 	// attempts to commit the circuit should cause the circuit map to
-	// indicate that that the HTLC should be failed back.
-	cdb, circuitMap = restartCircuitMap(t, cdb)
+	// indicate that the HTLC should be failed back.
+	cfg, circuitMap = restartCircuitMap(t, cfg)
 
 	actions, err = circuitMap.CommitCircuits(circuit)
 	if err != nil {
@@ -664,18 +780,14 @@ func TestCircuitMapOpenCircuits(t *testing.T) {
 		err        error
 	)
 
-	cdb := makeCircuitDB(t, "")
-	circuitMap, err = htlcswitch.NewCircuitMap(cdb)
-	if err != nil {
-		t.Fatalf("unable to create persistent circuit map: %v", err)
-	}
+	cfg, circuitMap := newCircuitMap(t)
 
 	circuit := &htlcswitch.PaymentCircuit{
 		Incoming: htlcswitch.CircuitKey{
 			ChanID: chan1,
 			HtlcID: 3,
 		},
-		ErrorEncrypter: htlcswitch.NewSphinxErrorEncrypter(),
+		ErrorEncrypter: testExtracter,
 	}
 
 	// First we will try to add an new circuit to the circuit map, this
@@ -747,7 +859,7 @@ func TestCircuitMapOpenCircuits(t *testing.T) {
 	//
 	// NOTE: The channel db doesn't have any channel data, so no keystones
 	// will be trimmed.
-	cdb, circuitMap = restartCircuitMap(t, cdb)
+	cfg, circuitMap = restartCircuitMap(t, cfg)
 
 	// Check that we can still query for the open circuit.
 	circuit2 = circuitMap.LookupOpenCircuit(keystone.OutKey)
@@ -874,11 +986,7 @@ func TestCircuitMapTrimOpenCircuits(t *testing.T) {
 		err        error
 	)
 
-	cdb := makeCircuitDB(t, "")
-	circuitMap, err = htlcswitch.NewCircuitMap(cdb)
-	if err != nil {
-		t.Fatalf("unable to create persistent circuit map: %v", err)
-	}
+	cfg, circuitMap := newCircuitMap(t)
 
 	const nCircuits = 10
 	const firstTrimIndex = 7
@@ -895,7 +1003,7 @@ func TestCircuitMapTrimOpenCircuits(t *testing.T) {
 				ChanID: chan1,
 				HtlcID: uint64(i + 3),
 			},
-			ErrorEncrypter: htlcswitch.NewSphinxErrorEncrypter(),
+			ErrorEncrypter: htlcswitch.NewMockObfuscator(),
 		}
 	}
 
@@ -951,9 +1059,9 @@ func TestCircuitMapTrimOpenCircuits(t *testing.T) {
 		firstTrimIndex,
 	)
 
-	// Restart the circuit map, verify that that the trim is reflected on
+	// Restart the circuit map, verify that the trim is reflected on
 	// startup.
-	cdb, circuitMap = restartCircuitMap(t, cdb)
+	cfg, circuitMap = restartCircuitMap(t, cfg)
 
 	assertCircuitsOpenedPostRestart(
 		t,
@@ -995,7 +1103,7 @@ func TestCircuitMapTrimOpenCircuits(t *testing.T) {
 
 	// Restart the circuit map one last time to make sure the changes are
 	// persisted.
-	cdb, circuitMap = restartCircuitMap(t, cdb)
+	cfg, circuitMap = restartCircuitMap(t, cfg)
 
 	assertCircuitsOpenedPostRestart(
 		t,
@@ -1027,18 +1135,16 @@ func TestCircuitMapCloseOpenCircuits(t *testing.T) {
 		err        error
 	)
 
-	cdb := makeCircuitDB(t, "")
-	circuitMap, err = htlcswitch.NewCircuitMap(cdb)
-	if err != nil {
-		t.Fatalf("unable to create persistent circuit map: %v", err)
-	}
+	cfg, circuitMap := newCircuitMap(t)
 
 	circuit := &htlcswitch.PaymentCircuit{
 		Incoming: htlcswitch.CircuitKey{
 			ChanID: chan1,
 			HtlcID: 3,
 		},
-		ErrorEncrypter: htlcswitch.NewSphinxErrorEncrypter(),
+		ErrorEncrypter: &htlcswitch.SphinxErrorEncrypter{
+			EphemeralKey: testEphemeralKey,
+		},
 	}
 
 	// First we will try to add an new circuit to the circuit map, this
@@ -1095,7 +1201,7 @@ func TestCircuitMapCloseOpenCircuits(t *testing.T) {
 	//
 	// NOTE: The channel db doesn't have any channel data, so no keystones
 	// will be trimmed.
-	cdb, circuitMap = restartCircuitMap(t, cdb)
+	cfg, circuitMap = restartCircuitMap(t, cfg)
 
 	// Close the open circuit for the first time, which should succeed.
 	_, err = circuitMap.FailCircuit(circuit.Incoming)
@@ -1122,18 +1228,14 @@ func TestCircuitMapCloseUnopenedCircuit(t *testing.T) {
 		err        error
 	)
 
-	cdb := makeCircuitDB(t, "")
-	circuitMap, err = htlcswitch.NewCircuitMap(cdb)
-	if err != nil {
-		t.Fatalf("unable to create persistent circuit map: %v", err)
-	}
+	cfg, circuitMap := newCircuitMap(t)
 
 	circuit := &htlcswitch.PaymentCircuit{
 		Incoming: htlcswitch.CircuitKey{
 			ChanID: chan1,
 			HtlcID: 3,
 		},
-		ErrorEncrypter: htlcswitch.NewSphinxErrorEncrypter(),
+		ErrorEncrypter: testExtracter,
 	}
 
 	// First we will try to add an new circuit to the circuit map, this
@@ -1157,7 +1259,7 @@ func TestCircuitMapCloseUnopenedCircuit(t *testing.T) {
 
 	// Now, restart the circuit map, which will result in the circuit being
 	// reopened, since no attempt to delete the circuit was made.
-	cdb, circuitMap = restartCircuitMap(t, cdb)
+	cfg, circuitMap = restartCircuitMap(t, cfg)
 
 	// Close the open circuit for the first time, which should succeed.
 	_, err = circuitMap.FailCircuit(circuit.Incoming)
@@ -1183,18 +1285,14 @@ func TestCircuitMapDeleteUnopenedCircuit(t *testing.T) {
 		err        error
 	)
 
-	cdb := makeCircuitDB(t, "")
-	circuitMap, err = htlcswitch.NewCircuitMap(cdb)
-	if err != nil {
-		t.Fatalf("unable to create persistent circuit map: %v", err)
-	}
+	cfg, circuitMap := newCircuitMap(t)
 
 	circuit := &htlcswitch.PaymentCircuit{
 		Incoming: htlcswitch.CircuitKey{
 			ChanID: chan1,
 			HtlcID: 3,
 		},
-		ErrorEncrypter: htlcswitch.NewSphinxErrorEncrypter(),
+		ErrorEncrypter: testExtracter,
 	}
 
 	// First we will try to add an new circuit to the circuit map, this
@@ -1225,7 +1323,7 @@ func TestCircuitMapDeleteUnopenedCircuit(t *testing.T) {
 
 	// Now, restart the circuit map, and check that the deletion survived
 	// the restart.
-	cdb, circuitMap = restartCircuitMap(t, cdb)
+	cfg, circuitMap = restartCircuitMap(t, cfg)
 
 	circuit2 = circuitMap.LookupCircuit(circuit.Incoming)
 	if circuit2 != nil {
@@ -1246,18 +1344,14 @@ func TestCircuitMapDeleteOpenCircuit(t *testing.T) {
 		err        error
 	)
 
-	cdb := makeCircuitDB(t, "")
-	circuitMap, err = htlcswitch.NewCircuitMap(cdb)
-	if err != nil {
-		t.Fatalf("unable to create persistent circuit map: %v", err)
-	}
+	cfg, circuitMap := newCircuitMap(t)
 
 	circuit := &htlcswitch.PaymentCircuit{
 		Incoming: htlcswitch.CircuitKey{
 			ChanID: chan1,
 			HtlcID: 3,
 		},
-		ErrorEncrypter: htlcswitch.NewSphinxErrorEncrypter(),
+		ErrorEncrypter: testExtracter,
 	}
 
 	// First we will try to add an new circuit to the circuit map, this
@@ -1302,7 +1396,7 @@ func TestCircuitMapDeleteOpenCircuit(t *testing.T) {
 
 	// Now, restart the circuit map, and check that the deletion survived
 	// the restart.
-	cdb, circuitMap = restartCircuitMap(t, cdb)
+	cfg, circuitMap = restartCircuitMap(t, cfg)
 
 	circuit2 = circuitMap.LookupOpenCircuit(keystone.OutKey)
 	if circuit2 != nil {

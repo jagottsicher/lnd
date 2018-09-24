@@ -8,9 +8,9 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btclog"
 	"github.com/lightningnetwork/lnd/channeldb"
-	"github.com/roasbeef/btcd/wire"
 )
 
 func init() {
@@ -88,7 +88,7 @@ func TestNurseryStoreInit(t *testing.T) {
 	}
 	defer cleanUp()
 
-	ns, err := newNurseryStore(&bitcoinGenesis, cdb)
+	ns, err := newNurseryStore(&bitcoinTestnetGenesis, cdb)
 	if err != nil {
 		t.Fatalf("unable to open nursery store: %v", err)
 	}
@@ -110,7 +110,7 @@ func TestNurseryStoreIncubate(t *testing.T) {
 	}
 	defer cleanUp()
 
-	ns, err := newNurseryStore(&bitcoinGenesis, cdb)
+	ns, err := newNurseryStore(&bitcoinTestnetGenesis, cdb)
 	if err != nil {
 		t.Fatalf("unable to open nursery store: %v", err)
 	}
@@ -350,7 +350,7 @@ func TestNurseryStoreFinalize(t *testing.T) {
 	}
 	defer cleanUp()
 
-	ns, err := newNurseryStore(&bitcoinGenesis, cdb)
+	ns, err := newNurseryStore(&bitcoinTestnetGenesis, cdb)
 	if err != nil {
 		t.Fatalf("unable to open nursery store: %v", err)
 	}
@@ -437,7 +437,7 @@ func TestNurseryStoreGraduate(t *testing.T) {
 	}
 	defer cleanUp()
 
-	ns, err := newNurseryStore(&bitcoinGenesis, cdb)
+	ns, err := newNurseryStore(&bitcoinTestnetGenesis, cdb)
 	if err != nil {
 		t.Fatalf("unable to open nursery store: %v", err)
 	}
