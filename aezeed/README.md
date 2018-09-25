@@ -87,7 +87,7 @@ The aezeed cipher seed scheme has a few cool properties, notably:
 
 * The mnemonic itself is a cipher text, meaning leaving it in
 plaintext is advisable if the user also set a passphrase. This is in
-contrast to BIP 39 where the mnemonic alone (without a passrphase) may
+contrast to BIP 39 where the mnemonic alone (without a passphrase) may
 be sufficient to steal funds.
 * A cipherseed can be modified to change the passphrase. This
 means that if the users wants a stronger passphrase, they can decipher
